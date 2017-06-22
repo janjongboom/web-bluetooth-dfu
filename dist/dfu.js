@@ -43,10 +43,6 @@
 }(this, function(Promise, bluetooth, crc16) {
     "use strict";
 
-    // Make server a global variable (initialized in connect().
-    // This fixes a bug in BlueZ that causes transfers to stall.
-    var currentServer = null;
-
     var LITTLE_ENDIAN = true;
 
     var packetSize = 20;
@@ -89,24 +85,38 @@
         PACKET_RECEIPT_NOTIFICATION: 17
     };
 
-    var loggers = [];
-    function addLogger(loggerFn) {
-        if (typeof loggerFn === "function") {
-            loggers.push(loggerFn);
-        }
-    }
-    function log(message) {
-        loggers.forEach(function(logger) {
-            logger(message);
-        });
+    function Dfu(ee) {
+        // Make server a global variable (initialized in connect().
+        // This fixes a bug in BlueZ that causes transfers to stall.
+        this.currentServer = null;
+
+        this.loggers = [];
+
+        this.interval = null;
+        this.offset = null;
+
+        this.ee = ee;
     }
 
-    function findDevice(filters) {
+    Dfu.prototype.addLogger = function (loggerFn) {
+        if (typeof loggerFn === "function") {
+            this.loggers.push(loggerFn);
+        }
+    };
+
+    Dfu.prototype.log = function (message) {
+        this.loggers.forEach(function(logger) {
+            logger(message);
+        });
+    };
+
+
+    Dfu.prototype.findDevice = function (filters) {
         return bluetooth.requestDevice({
             filters: [ filters ],
             optionalServices: [serviceUUID]
         });
-    }
+    };
 
     /**
      * Switch to bootloader/DFU mode by writing to the control point of the DFU Service.
@@ -115,14 +125,16 @@
      *
      * https://infocenter.nordicsemi.com/topic/com.nordic.infocenter.sdk5.v11.0.0/bledfu_appswitching.html?cp=4_0_0_4_1_3_2_2
      */
-    function writeMode(device) {
+    Dfu.prototype.writeMode = function(device) {
+        var self = this;
+
         return new Promise(function(resolve, reject) {
 
             var resolved = false;
             function disconnectHandler() {
                 if (!resolved) {
                     resolved = true;
-                    log("DFU target issued GAP disconnect and reset into bootloader/DFU mode");
+                    self.log("DFU target issued GAP disconnect and reset into bootloader/DFU mode");
                     resolve(device);
                 }
             }
@@ -130,33 +142,33 @@
 
             var characteristics = null;
 
-            connect(device)
+            self.connect(device)
             .then(function(chars) {
-                log("enabling notifications");
+                self.log("enabling notifications");
                 characteristics = chars;
                 return characteristics.controlChar.startNotifications();
             })
             .then(function() {
-                log("writing modeData");
+                self.log("writing modeData");
                 return characteristics.controlChar.writeValue(new Uint8Array([OPCODE.START_DFU, ImageType.Application]));
             })
             .then(function() {
-                log("modeData written");
+                self.log("modeData written");
                 // TODO: Remove this when gattserverdisconnected event is implemented and possibly put a timeout in that event handler before resolving
                 setTimeout(function() {
-                    if (currentServer && currentServer.connected === true) {
-                        currentServer.disconnect();
+                    if (self.currentServer && self.currentServer.connected === true) {
+                        self.currentServer.disconnect();
                     }
                     disconnectHandler();
                 }, 5000);
             })
             .catch(function(error) {
                 error = "writeMode error: " + error;
-                log(error);
+                self.log(error);
                 reject(error);
             });
         });
-    }
+    };
 
     /**
      * Contains basic functionality for performing safety checks on software updates for nRF5 based devices.
@@ -165,7 +177,9 @@
      *
      * Not used in mbed bootloader (init packet was optional in SDK v6.x).
      */
-    function generateInitPacket() {
+    Dfu.prototype.generateInitPacket = function () {
+        var self = this;
+
         var buffer = new ArrayBuffer(14);
         var view = new DataView(buffer);
         view.setUint16(0, initPacket.device_type, LITTLE_ENDIAN);
@@ -177,40 +191,44 @@
         return view;
     }
 
-    function provision(device, arrayBuffer, imageType, crc) {
+    Dfu.prototype.provision = function (device, arrayBuffer, imageType, crc) {
+        var self = this;
+
         return new Promise(function(resolve, reject) {
             imageType = imageType || ImageType.Application;
             initPacket.crc = crc || crc16(arrayBuffer);
             var versionChar = null;
 
-            connect(device)
+            self.connect(device)
             .then(function(chars) {
                 versionChar = chars.versionChar;
                 // Older DFU implementations (from older Nordic SDKs < 7.0) have no DFU Version characteristic.
                 if (versionChar) {
                     return versionChar.readValue()
                     .then(function(data) {
-                        log('read versionChar');
+                        self.log('read versionChar');
                         var major = data.getUint8(0);
                         var minor = data.getUint8(1);
-                        return transfer(chars, arrayBuffer, imageType, major, minor);
+                        return self.transfer(chars, arrayBuffer, imageType, major, minor);
                     });
                 } else {
                     // Default to version 6.0 (mbed).
-                    return transfer(chars, arrayBuffer, imageType, 6, 0);
+                    return self.transfer(chars, arrayBuffer, imageType, 6, 0);
                 }
             })
             .then(function() {
                 resolve();
             })
             .catch(function(error) {
-                log(error);
+                self.log(error);
                 reject(error);
             });
         });
     }
 
-    function connect(device) {
+    Dfu.prototype.connect = function (device) {
+        var self = this;
+
         return new Promise(function(resolve, reject) {
             var service = null;
             var controlChar = null;
@@ -227,86 +245,86 @@
 
             device.gatt.connect()
             .then(function(gattServer) {
-                log("connected to device");
-                currentServer = gattServer;
+                self.log("connected to device");
+                self.currentServer = gattServer;
                 // This delay is needed because BlueZ needs time to update it's cache.
                 return new Promise(function(resolve) {
                     setTimeout(resolve, 2000);
                 });
             })
-            .then(function() {
-                return currentServer.getPrimaryService(serviceUUID);
+            .then(function(services) {
+                return self.currentServer.getPrimaryService(serviceUUID);
             })
             .then(function(primaryService) {
-                log("found DFU service");
+                self.log("found DFU service");
                 service = primaryService;
                 return service.getCharacteristic(controlUUID);
             })
             .then(function(characteristic) {
-                log("found control characteristic");
+                self.log("found control characteristic");
                 controlChar = characteristic;
                 return service.getCharacteristic(packetUUID);
             })
             .then(function(characteristic) {
-                log("found packet characteristic");
+                self.log("found packet characteristic");
                 packetChar = characteristic;
                 service.getCharacteristic(versionUUID)
                 // Older DFU implementations (from older Nordic SDKs) have no DFU Version characteristic. So this may fail.
                 .then(function(characteristic) {
-                    log("found version characteristic");
+                    self.log("found version characteristic");
                     versionChar = characteristic;
                     complete();
                 })
                 .catch(function() {
-                    log("info: no version characteristic found");
+                    self.log("info: no version characteristic found");
                     complete();
                 });
             })
             .catch(function(error) {
                 error = "connect error: " + error;
-                log(error);
+                self.log(error);
                 reject(error);
             });
         });
     }
 
-    var interval;
-    var offset;
-    function transfer(chars, arrayBuffer, imageType, majorVersion, minorVersion) {
+    Dfu.prototype.transfer = function (chars, arrayBuffer, imageType, majorVersion, minorVersion) {
+        var self = this;
+
         return new Promise(function(resolve, reject) {
             var controlChar = chars.controlChar;
             var packetChar = chars.packetChar;
-            log('using dfu version ' + majorVersion + "." + minorVersion);
+            self.log('using dfu version ' + majorVersion + "." + minorVersion);
 
             var resolved = false;
             function disconnectHandler() {
                 if (!resolved) {
                     resolved = true;
-                    log('disconnected and completed the DFU transfer');
+                    self.log('disconnected and completed the DFU transfer');
                     resolve();
                 }
             }
-            currentServer.device.addEventListener("gattserverdisconnected", disconnectHandler);
+            self.currentServer.device.addEventListener("gattserverdisconnected", disconnectHandler);
 
             // Set up receipts
-            interval = Math.floor(arrayBuffer.byteLength / (packetSize * notifySteps));
-            offset = 0;
+            self.interval = Math.floor(arrayBuffer.byteLength / (packetSize * notifySteps));
+            self.offset = 0;
 
             if (!controlChar.properties.notify) {
                 var err = "controlChar missing notify property";
-                log(err);
+                self.log(err);
                 return reject(err);
             }
 
-            log("enabling notifications");
+            self.log("enabling notifications");
             controlChar.startNotifications()
             .then(function() {
                 controlChar.addEventListener('characteristicvaluechanged', handleControl);
-                log("sending imagetype: " + imageType);
+                self.log("sending imagetype: " + imageType);
                 return controlChar.writeValue(new Uint8Array([OPCODE.START_DFU, imageType]));
             })
             .then(function() {
-                log("sent start");
+                self.log("sent start");
 
                 var softLength = (imageType === ImageType.SoftDevice) ? arrayBuffer.byteLength : 0;
                 var bootLength = (imageType === ImageType.Bootloader) ? arrayBuffer.byteLength : 0;
@@ -321,11 +339,11 @@
                 return packetChar.writeValue(view);
             })
             .then(function() {
-                log("sent image size: " + arrayBuffer.byteLength);
+                self.log("sent image size: " + arrayBuffer.byteLength);
             })
             .catch(function(error) {
                 error = "start error: " + error;
-                log(error);
+                self.log(error);
                 reject(error);
             });
 
@@ -339,7 +357,7 @@
                 if (opCode === OPCODE.RESPONSE_CODE) {
                     if (resp_code !== 1) {
                         var err = "error from control point notification, resp_code: " + resp_code;
-                        log(err);
+                        self.log(err);
                         return reject(err);
                     }
 
@@ -347,124 +365,125 @@
                         case OPCODE.START_DFU:
                         case OPCODE.INITIALIZE_DFU_PARAMETERS:
                             if(req_opcode === OPCODE.START_DFU && majorVersion > 6) { // init packet is not used in SDK v6 (so not used in mbed).
-                                log('write init packet');
+                                self.log('write init packet');
                                 controlChar.writeValue(new Uint8Array([OPCODE.INITIALIZE_DFU_PARAMETERS, 0]))
                                 .then(function() {
-                                    return packetChar.writeValue(generateInitPacket());
+                                    return packetChar.writeValue(self.generateInitPacket());
                                 })
                                 .then(function() {
                                     return controlChar.writeValue(new Uint8Array([OPCODE.INITIALIZE_DFU_PARAMETERS, 1]));
                                 })
                                 .catch(function(error) {
                                     error = "error writing dfu init parameters: " + error;
-                                    log(error);
+                                    self.log(error);
                                     reject(error);
                                 });
                                 break;
                             }
 
-                            log('send packet count');
+                            self.log('send packet count');
 
                             var buffer = new ArrayBuffer(3);
                             view = new DataView(buffer);
                             view.setUint8(0, OPCODE.PACKET_RECEIPT_NOTIFICATION_REQUEST);
-                            view.setUint16(1, interval, LITTLE_ENDIAN);
+                            view.setUint16(1, self.interval, LITTLE_ENDIAN);
 
                             controlChar.writeValue(view)
                             .then(function() {
-                                log("sent packet count: " + interval);
+                                self.log("sent packet count: " + self.interval);
                                 return controlChar.writeValue(new Uint8Array([OPCODE.RECEIVE_FIRMWARE_IMAGE]));
                             })
                             .then(function() {
-                                log("sent receive");
-                                return writePacket(packetChar, arrayBuffer, 0);
+                                self.log("sent receive");
+                                return self.writePacket(packetChar, arrayBuffer, 0);
                             })
                             .catch(function(error) {
                                 error = "error sending packet count: " + error;
-                                log(error);
+                                self.log(error);
                                 reject(error);
                             });
                             break;
                         case OPCODE.RECEIVE_FIRMWARE_IMAGE:
-                            log('check length');
+                            self.log('check length');
 
                             controlChar.writeValue(new Uint8Array([OPCODE.REPORT_RECEIVED_IMAGE_SIZE]))
                             .catch(function(error) {
                                 error = "error checking length: " + error;
-                                log(error);
+                                self.log(error);
                                 reject(error);
                             });
                             break;
                         case OPCODE.REPORT_RECEIVED_IMAGE_SIZE:
                             var bytesReceived = view.getUint32(3, LITTLE_ENDIAN);
-                            log('length: ' + bytesReceived);
-                            log('validate...');
+                            self.log('length: ' + bytesReceived);
+                            self.log('validate...');
 
                             controlChar.writeValue(new Uint8Array([OPCODE.VALIDATE_FIRMWARE]))
                             .catch(function(error) {
                                 error = "error validating: " + error;
-                                log(error);
+                                self.log(error);
                                 reject(error);
                             });
                             break;
                         case OPCODE.VALIDATE_FIRMWARE:
-                            log('complete, reset...');
+                            self.log('complete, reset...');
 
                             controlChar.writeValue(new Uint8Array([OPCODE.ACTIVATE_IMAGE_AND_RESET]))
                             .then(function() {
-                                log('image activated and dfu target reset');
+                                self.log('image activated and dfu target reset');
                                 // TODO: Remove this when gattserverdisconnected event is implemented and possibly put a timeout in that event handler before resolving
                                 setTimeout(function() {
-                                    if (currentServer && currentServer.connected === true) {
-                                        currentServer.disconnect();
+                                    if (self.currentServer && self.currentServer.connected === true) {
+                                        self.currentServer.disconnect();
                                     }
                                     disconnectHandler();
                                 }, 5000);
                             })
                             .catch(function(error) {
                                 error = "error resetting: " + error;
-                                log(error);
+                                self.log(error);
                                 reject(error);
                             });
                             break;
                         default:
-                            log('unexpected req opCode - ERROR');
+                            self.log('unexpected req opCode - ERROR');
                             break;
                     }
 
                 } else if (opCode === OPCODE.PACKET_RECEIPT_NOTIFICATION) {
                     var bytes = view.getUint32(1, LITTLE_ENDIAN);
-                    log('transferred: ' + bytes);
-                    writePacket(packetChar, arrayBuffer, 0);
+                    self.log('transferred: ' + bytes + '/' + arrayBuffer.byteLength + ' bytes');
+
+                    if (self.ee) {
+                        self.ee.emit('provision-progress', bytes / arrayBuffer.byteLength);
+                    }
+
+                    self.writePacket(packetChar, arrayBuffer, 0);
                 }
             }
         });
     }
 
-    function writePacket(packetChar, arrayBuffer, count) {
-        var size = (offset + packetSize > arrayBuffer.byteLength) ? arrayBuffer.byteLength - offset : packetSize;
-        var packet = arrayBuffer.slice(offset, offset + size);
+    Dfu.prototype.writePacket = function (packetChar, arrayBuffer, count) {
+        var self = this;
+
+        var size = (self.offset + packetSize > arrayBuffer.byteLength) ? arrayBuffer.byteLength - self.offset : packetSize;
+        var packet = arrayBuffer.slice(self.offset, self.offset + size);
         var view = new Uint8Array(packet);
 
         packetChar.writeValue(view)
         .then(function() {
             count ++;
-            offset += packetSize;
-            if (count < interval && offset < arrayBuffer.byteLength) {
-                writePacket(packetChar, arrayBuffer, count);
+            self.offset += packetSize;
+            if (count < self.interval && self.offset < arrayBuffer.byteLength) {
+                self.writePacket(packetChar, arrayBuffer, count);
             }
         })
         .catch(function(error) {
             error = "writePacket error: " + error;
-            log(error);
+            self.log(error);
         });
     }
 
-    return {
-        addLogger: addLogger,
-        ImageType: ImageType,
-        findDevice: findDevice,
-        writeMode: writeMode,
-        provision: provision
-    };
+    return Dfu;
 }));
